@@ -1,0 +1,534 @@
+# 02_synteny_plot.R
+#
+# Synteny analysis and visualisation between two genomes (Genome_A / Genome_B)
+# using whole-genome alignment (PAF, from minimap2) and Gypsy transposable
+# element density (GFF for Genome_A, BLAST TSV for Genome_B).
+#
+# Pipeline:
+#   1) Parse Gypsy TE density per genome (GFF for A, BLAST TSV for B) via a
+#      shared windowing/summarising function
+#   2) Read genome FASTAs and PAF alignment; sanity-check chromosome IDs
+#   3) Build a pairwise chromosome synteny score matrix
+#   4) Find the optimal one-to-one chromosome assignment that maximises
+#      total synteny (Hungarian algorithm via clue::solve_LSAP) -- this
+#      avoids naively assuming chr01<->chr01, chr02<->chr02, etc., and
+#      instead finds the best-matching chromosome pairs based on actual
+#      alignment coverage.
+#   5) Compute strict reciprocal synteny using only the assigned best pairs
+#   6) Generate per-chromosome-pair synteny + Gypsy-density plots (gggenomes)
+#
+# Requirements (R packages):
+#   gggenomes, ggplot2, dplyr, data.table, clue, scales,
+#   GenomicRanges, IRanges (Bioconductor -- see install note below)
+#
+#   if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+#   BiocManager::install(c("GenomicRanges", "IRanges"))
+#
+# Inputs (set below under USER INPUTS):
+#   - GD_GFF     : GFF3 annotation for Genome_A, used to extract Gypsy elements
+#   - PEAR_BLAST : BLAST outfmt-6 TSV of Gypsy elements vs Genome_B
+#                  (output of 01b_blast_gypsy.py)
+#   - GD_FASTA   : Genome_A FASTA
+#   - PEAR_FASTA : Genome_B FASTA
+#   - PAF_FILE   : whole-genome alignment PAF, Genome_A vs Genome_B
+#                  (output of 01a_synteny_alignment.slurm)
+#
+# Outputs (written to OUTDIR):
+#   - all_pairwise_chromosome_synteny.csv
+#   - assigned_best_pairs.csv
+#   - overall_reciprocal_synteny_strict.csv
+#   - synteny_<chrA>_vs_<chrB>.png (one plot per assigned chromosome pair)
+
+# Set working directory to the folder containing your input files
+# setwd("path/to/your/data")
+
+library(gggenomes)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(clue)
+library(GenomicRanges)
+library(IRanges)
+
+## ══════════════════════════════════════════════════════════════════════════════
+## USER INPUTS
+## ══════════════════════════════════════════════════════════════════════════════
+
+GD_GFF       <- "GD.gff3"
+PEAR_BLAST   <- "gypsy_vs_genomeDA.tsv"   # <-- change
+GD_FASTA     <- "GDT2T_hap1_v1.0.fa"
+PEAR_FASTA   <- "Pyrus_hap1.fasta"   # <-- change
+PAF_FILE     <- "DA.paf"         # <-- change
+
+OUTDIR       <- "Fusion_DA_B"
+N_CHRS       <- 17
+WIN_SIZE     <- 1e6
+MIN_ALN      <- 5000
+MIN_MAPQ     <- 20
+MIN_PIDENT   <- 70
+MIN_BLASTALN <- 100
+
+dir.create(OUTDIR, showWarnings = FALSE)
+
+## ══════════════════════════════════════════════════════════════════════════════
+## HELPERS
+## ══════════════════════════════════════════════════════════════════════════════
+
+## ── Merged covered base pairs via GenomicRanges (replaces manual interval
+## merging: handles unsorted/overlapping ranges robustly and is battle-tested) ──
+covered_bp <- function(starts, ends) {
+  if (length(starts) == 0) return(0)
+  gr <- GRanges(seqnames = "x", ranges = IRanges(start = starts, end = ends))
+  sum(width(reduce(gr)))
+}
+
+extract_chr_num <- function(x) {
+  x <- trimws(as.character(x))
+  m1 <- suppressWarnings(as.integer(sub("(?i)^chr0*([0-9]+)[^0-9]?.*$", "\\1", x, perl = TRUE)))
+  m2 <- suppressWarnings(as.integer(sub(".*[_\\-\\.]0*([0-9]+)$", "\\1", x, perl = TRUE)))
+  m3 <- suppressWarnings(as.integer(sub(".*?0*([0-9]+)[^0-9]*$", "\\1", x, perl = TRUE)))
+  ifelse(!is.na(m1), m1, ifelse(!is.na(m2), m2, m3))
+}
+
+## ── Sanity-check chromosome IDs after extract_chr_num() ─────────────────────
+## Catches the two failure modes that would otherwise corrupt downstream
+## synteny results silently:
+##   (1) two different original seq_ids collapsing onto the same chr_num
+##       (e.g. "chr1" and "chr01_alt" both -> chr_num 1)
+##   (2) fewer distinct chromosomes than expected (N_CHRS), suggesting a
+##       parsing/regex mismatch against the actual FASTA/GFF headers
+check_chr_ids <- function(chr_nums, bin_label, n_chrs, seq_ids = NULL) {
+  chr_nums_nonNA <- chr_nums[!is.na(chr_nums)]
+
+  dup <- chr_nums_nonNA[duplicated(chr_nums_nonNA)]
+  if (length(dup) > 0) {
+    dup_detail <- if (!is.null(seq_ids)) {
+      offending <- seq_ids[chr_nums %in% unique(dup)]
+      paste0(" Offending seq_ids: ", paste(unique(offending), collapse = ", "))
+    } else ""
+    stop(sprintf(
+      "[%s] Duplicate chromosome numbers after extract_chr_num(): %s.%s
+Two different sequence IDs are mapping to the same chromosome -- check the regex in extract_chr_num() against your actual seq_id/seqid format before continuing.",
+      bin_label, paste(unique(dup), collapse = ", "), dup_detail
+    ))
+  }
+
+  n_found <- length(unique(chr_nums_nonNA))
+  if (n_found != n_chrs) {
+    warning(sprintf(
+      "[%s] Expected %d chromosomes but found %d distinct chromosome numbers (1..%d expected). Check N_CHRS and extract_chr_num() against your data.",
+      bin_label, n_chrs, n_found, n_chrs
+    ))
+  }
+
+  invisible(TRUE)
+}
+
+read_seqs_clean <- function(fasta_file, bin_label, n_chrs = 17) {
+  seqs <- read_seqs(fasta_file) %>%
+    mutate(
+      bin_id  = bin_label,
+      chr_num = extract_chr_num(seq_id)
+    ) %>%
+    filter(!is.na(chr_num), chr_num >= 1, chr_num <= n_chrs)
+
+  check_chr_ids(seqs$chr_num, bin_label, n_chrs, seq_ids = seqs$seq_id)
+
+  seqs %>% mutate(seq_id = sprintf("chr%02d", chr_num))
+}
+
+## ── Shared Gypsy windowing/summarising logic ─────────────────────────────────
+## Both the GFF parser (Genome_A) and the BLAST-TSV parser (Genome_B) reduce
+## to the same shape once they've computed (chr, start, end, length): bin
+## hits into fixed-size genomic windows, sum bp per window, normalise per
+## chromosome. That shared step now lives in one place instead of being
+## duplicated across two parsing functions.
+summarise_gypsy_windows <- function(df, bin_label, win_size, n_chrs) {
+  df %>%
+    mutate(
+      pos    = (start + end) / 2,
+      win_id = floor(pos / win_size)
+    ) %>%
+    group_by(chr, chr_num, win_id) %>%
+    summarise(gypsy_bp = sum(length), n_hits = n(), .groups = "drop") %>%
+    transmute(
+      bin_id = bin_label,
+      seq_id = chr,
+      start  = as.integer(win_id * win_size + 1L),
+      end    = as.integer((win_id + 1L) * win_size),
+      score  = gypsy_bp,
+      n_hits = n_hits
+    ) %>%
+    group_by(seq_id) %>%
+    mutate(score = score / max(score)) %>%
+    ungroup()
+}
+
+## ── Parse Gypsy from GFF (Genome A) ─────────────────────────────────────────
+parse_gypsy_gff <- function(gff_file, bin_label, win_size = 1e6, n_chrs = 17) {
+  gff_raw <- fread(
+    gff_file,
+    skip = "#",
+    col.names = c("seqid","source","type","start","end","score",
+                  "strand","phase","attributes")
+  )
+
+  cat("Total GFF entries (", bin_label, "):", nrow(gff_raw), "\n")
+  if (nrow(gff_raw) == 0) stop(paste("GFF file has no entries:", gff_file))
+
+  gypsy <- gff_raw %>%
+    filter(
+      grepl("gypsy", type, ignore.case = TRUE) |
+        grepl("gypsy", attributes, ignore.case = TRUE)
+    )
+
+  cat("Gypsy elements found (", bin_label, "):", nrow(gypsy), "\n")
+  if (nrow(gypsy) == 0) stop(paste("No Gypsy elements found in:", gff_file))
+
+  gypsy <- gypsy %>%
+    mutate(chr_num = extract_chr_num(seqid)) %>%
+    filter(!is.na(chr_num), chr_num >= 1, chr_num <= n_chrs) %>%
+    mutate(chr = sprintf("chr%02d", chr_num), length = end - start + 1)
+
+  check_chr_ids(gypsy$chr_num, paste0(bin_label, " (Gypsy GFF)"), n_chrs, seq_ids = gypsy$seqid)
+
+  summarise_gypsy_windows(gypsy, bin_label, win_size, n_chrs)
+}
+
+## ── Parse Gypsy from BLAST TSV (Genome B) ───────────────────────────────────
+parse_gypsy_tsv <- function(tsv_file, bin_label, win_size = 1e6, n_chrs = 17,
+                            min_pident = 70, min_aln = 100) {
+  blast <- fread(
+    tsv_file,
+    col.names = c("qname","seqid","pident","aln_len","mismatches","gaps",
+                  "qstart","qend","sstart","send","evalue","bitscore")
+  )
+
+  cat("Total BLAST hits (", bin_label, "):", nrow(blast), "\n")
+  if (nrow(blast) == 0) stop(paste("BLAST TSV file is empty:", tsv_file))
+
+  blast <- blast %>%
+    filter(pident >= min_pident, aln_len >= min_aln) %>%
+    mutate(
+      start   = pmin(sstart, send),
+      end     = pmax(sstart, send),
+      length  = end - start + 1,
+      chr_num = extract_chr_num(seqid)
+    ) %>%
+    filter(!is.na(chr_num), chr_num >= 1, chr_num <= n_chrs) %>%
+    mutate(chr = sprintf("chr%02d", chr_num))
+
+  check_chr_ids(blast$chr_num, paste0(bin_label, " (Gypsy BLAST)"), n_chrs, seq_ids = blast$seqid)
+
+  summarise_gypsy_windows(blast, bin_label, win_size, n_chrs)
+}
+
+## ── Read and clean PAF ──────────────────────────────────────────────────────
+## Assumption: qname = Genome_A, tname = Genome_B
+## If your PAF was generated in the opposite direction, swap q/t here.
+read_links_clean <- function(paf_file, min_aln = 5000, min_mapq = 20, n_chrs = 17) {
+  links <- read.delim(
+    paf_file,
+    header = FALSE,
+    fill   = TRUE,
+    quote  = "",
+    sep    = "\t"
+  )[, 1:12]
+
+  colnames(links) <- c("qname","qlen","qstart","qend","strand",
+                       "tname","tlen","tstart","tend","nmatch","alen","mapq")
+
+  links %>%
+    transmute(
+      qname, qlen, qstart, qend,
+      tname, tlen, tstart, tend,
+      strand, mapq,
+      aln_len = qend - qstart,
+      pid     = nmatch / pmax(alen, 1)
+    ) %>%
+    filter(aln_len >= min_aln, mapq >= min_mapq) %>%
+    mutate(
+      chr_num_q = extract_chr_num(qname),
+      chr_num_t = extract_chr_num(tname)
+    ) %>%
+    filter(
+      !is.na(chr_num_q), !is.na(chr_num_t),
+      chr_num_q >= 1, chr_num_q <= n_chrs,
+      chr_num_t >= 1, chr_num_t <= n_chrs
+    ) %>%
+    transmute(
+      seq_id  = sprintf("chr%02d", chr_num_q),
+      start   = qstart + 1L,
+      end     = qend,
+      seq_id2 = sprintf("chr%02d", chr_num_t),
+      start2  = tstart + 1L,
+      end2    = tend,
+      strand,
+      mapq,
+      aln_len,
+      pid,
+      sv_type = ifelse(strand == "-", "Inversion", "Collinear")
+    )
+}
+
+## ── Build pairwise chromosome synteny matrix ────────────────────────────────
+build_pairwise_synteny <- function(links, seqs_A, seqs_B) {
+  gd_lengths <- seqs_A %>%
+    transmute(GD_chr = seq_id, GD_len = as.numeric(length))
+
+  pear_lengths <- seqs_B %>%
+    transmute(Pear_chr = seq_id, Pear_len = as.numeric(length))
+
+  pair_stats <- links %>%
+    group_by(seq_id, seq_id2) %>%
+    summarise(
+      GD_covered_bp   = covered_bp(start, end),
+      Pear_covered_bp = covered_bp(start2, end2),
+      n_blocks        = n(),
+      mean_pid        = mean(pid, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    rename(GD_chr = seq_id, Pear_chr = seq_id2) %>%
+    left_join(gd_lengths, by = "GD_chr") %>%
+    left_join(pear_lengths, by = "Pear_chr") %>%
+    mutate(
+      score                   = pmin(GD_covered_bp, Pear_covered_bp),
+      GD_synteny_pct          = 100 * GD_covered_bp / GD_len,
+      Pear_synteny_pct        = 100 * Pear_covered_bp / Pear_len,
+      reciprocal_synteny_pct  = 100 * pmin(GD_covered_bp / GD_len,
+                                           Pear_covered_bp / Pear_len)
+    )
+
+  gd_chrs   <- sort(unique(seqs_A$seq_id))
+  pear_chrs <- sort(unique(seqs_B$seq_id))
+
+  score_mat <- matrix(
+    0,
+    nrow = length(gd_chrs),
+    ncol = length(pear_chrs),
+    dimnames = list(gd_chrs, pear_chrs)
+  )
+
+  for (i in seq_len(nrow(pair_stats))) {
+    score_mat[pair_stats$GD_chr[i], pair_stats$Pear_chr[i]] <- pair_stats$score[i]
+  }
+
+  list(pair_stats = pair_stats, score_mat = score_mat)
+}
+
+## ── One-to-one maximum-synteny chromosome assignment (Hungarian algorithm) ──
+assign_best_pairs <- function(pairwise_obj) {
+  score_mat <- pairwise_obj$score_mat
+  pair_stats <- pairwise_obj$pair_stats
+
+  if (nrow(score_mat) > ncol(score_mat)) {
+    stop("Number of Genome_A chromosomes is greater than Genome_B chromosomes. solve_LSAP needs nrow <= ncol.")
+  }
+
+  assignment <- solve_LSAP(score_mat, maximum = TRUE)
+
+  assigned_pairs <- data.frame(
+    GD_chr   = rownames(score_mat),
+    Pear_chr = colnames(score_mat)[assignment],
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(pair_stats, by = c("GD_chr", "Pear_chr")) %>%
+    arrange(extract_chr_num(GD_chr))
+
+  assigned_pairs
+}
+
+## ── Strict reciprocal synteny: only assigned chromosome pairs ───────────────
+calc_strict_overall_synteny <- function(links, seqs_A, seqs_B, assigned_pairs) {
+  strict_links <- links %>%
+    inner_join(
+      assigned_pairs %>% select(GD_chr, Pear_chr),
+      by = c("seq_id" = "GD_chr", "seq_id2" = "Pear_chr")
+    )
+
+  len_A <- sum(as.numeric(seqs_A$length))
+  len_B <- sum(as.numeric(seqs_B$length))
+
+  cov_A <- strict_links %>%
+    group_by(seq_id) %>%
+    summarise(bp = covered_bp(start, end), .groups = "drop") %>%
+    summarise(total = sum(bp)) %>%
+    pull(total)
+
+  cov_B <- strict_links %>%
+    group_by(seq_id2) %>%
+    summarise(bp = covered_bp(start2, end2), .groups = "drop") %>%
+    summarise(total = sum(bp)) %>%
+    pull(total)
+
+  if (length(cov_A) == 0 || is.na(cov_A)) cov_A <- 0
+  if (length(cov_B) == 0 || is.na(cov_B)) cov_B <- 0
+
+  data.frame(
+    GD_total_bp            = len_A,
+    Pear_total_bp          = len_B,
+    GD_covered_bp          = cov_A,
+    Pear_covered_bp        = cov_B,
+    GD_synteny_pct         = 100 * cov_A / len_A,
+    Pear_synteny_pct       = 100 * cov_B / len_B,
+    reciprocal_synteny_pct = 100 * min(cov_A / len_A, cov_B / len_B)
+  )
+}
+
+## ══════════════════════════════════════════════════════════════════════════════
+## 1) PARSE GYPSY
+## ══════════════════════════════════════════════════════════════════════════════
+
+gypsy_cov_A <- parse_gypsy_gff(
+  GD_GFF,
+  bin_label = "Genome_A",
+  win_size  = WIN_SIZE,
+  n_chrs    = N_CHRS
+)
+
+gypsy_cov_B <- parse_gypsy_tsv(
+  PEAR_BLAST,
+  bin_label  = "Genome_B",
+  win_size   = WIN_SIZE,
+  n_chrs     = N_CHRS,
+  min_pident = MIN_PIDENT,
+  min_aln    = MIN_BLASTALN
+)
+
+## ══════════════════════════════════════════════════════════════════════════════
+## 2) READ FASTAS
+## ══════════════════════════════════════════════════════════════════════════════
+
+seqs_A <- read_seqs_clean(GD_FASTA,   "Genome_A", n_chrs = N_CHRS)
+seqs_B <- read_seqs_clean(PEAR_FASTA, "Genome_B", n_chrs = N_CHRS)
+
+## ══════════════════════════════════════════════════════════════════════════════
+## 3) READ PAF
+## ══════════════════════════════════════════════════════════════════════════════
+
+links <- read_links_clean(
+  PAF_FILE,
+  min_aln  = MIN_ALN,
+  min_mapq = MIN_MAPQ,
+  n_chrs   = N_CHRS
+) %>%
+  filter(seq_id %in% seqs_A$seq_id, seq_id2 %in% seqs_B$seq_id)
+
+cat("\nTotal filtered alignments:", nrow(links), "\n")
+cat("Alignment classes:\n")
+print(table(links$sv_type))
+
+## ══════════════════════════════════════════════════════════════════════════════
+## 4) MAXIMUM-SYNTENY CHROMOSOME ASSIGNMENT
+## ══════════════════════════════════════════════════════════════════════════════
+
+pairwise_obj   <- build_pairwise_synteny(links, seqs_A, seqs_B)
+per_chr_synteny <- pairwise_obj$pair_stats
+assigned_pairs <- assign_best_pairs(pairwise_obj)
+
+fwrite(per_chr_synteny, file.path(OUTDIR, "all_pairwise_chromosome_synteny.csv"))
+fwrite(assigned_pairs, file.path(OUTDIR, "assigned_best_pairs.csv"))
+
+cat("\n── Maximum-synteny one-to-one chromosome assignment ──\n")
+print(assigned_pairs)
+
+## ══════════════════════════════════════════════════════════════════════════════
+## 5) STRICT OVERALL RECIPROCAL SYNTENY
+## ══════════════════════════════════════════════════════════════════════════════
+
+overall_synteny <- calc_strict_overall_synteny(links, seqs_A, seqs_B, assigned_pairs)
+
+cat("\n── Strict synteny summary (only assigned best chromosome pairs) ──\n")
+cat(sprintf("  Genome_A total length : %s bp\n", format(overall_synteny$GD_total_bp,   big.mark=",")))
+cat(sprintf("  Genome_B total length : %s bp\n", format(overall_synteny$Pear_total_bp, big.mark=",")))
+cat(sprintf("  Genome_A covered      : %s bp (%.2f%%)\n",
+            format(overall_synteny$GD_covered_bp, big.mark=","), overall_synteny$GD_synteny_pct))
+cat(sprintf("  Genome_B covered      : %s bp (%.2f%%)\n",
+            format(overall_synteny$Pear_covered_bp, big.mark=","), overall_synteny$Pear_synteny_pct))
+cat(sprintf("  Reciprocal synteny    : %.2f%%\n\n",
+            overall_synteny$reciprocal_synteny_pct))
+
+fwrite(overall_synteny, file.path(OUTDIR, "overall_reciprocal_synteny_strict.csv"))
+
+## ══════════════════════════════════════════════════════════════════════════════
+## 6) PLOTS FOR ASSIGNED BEST PAIRS
+## ══════════════════════════════════════════════════════════════════════════════
+
+cat("Generating plots for", nrow(assigned_pairs), "assigned chromosome pairs...\n")
+
+for (i in seq_len(nrow(assigned_pairs))) {
+  gd_chr   <- assigned_pairs$GD_chr[i]
+  pear_chr <- assigned_pairs$Pear_chr[i]
+
+  cat("Processing", gd_chr, "vs", pear_chr, "...\n")
+
+  lf <- links %>%
+    filter(seq_id == gd_chr, seq_id2 == pear_chr)
+
+  ss <- bind_rows(
+    seqs_A %>% filter(seq_id == gd_chr),
+    seqs_B %>% filter(seq_id == pear_chr)
+  )
+
+  gfA <- gypsy_cov_A %>% filter(seq_id == gd_chr)
+  gfB <- gypsy_cov_B %>% filter(seq_id == pear_chr)
+
+  if (nrow(lf) == 0 || nrow(ss) < 2) {
+    cat("  Skipping", gd_chr, "vs", pear_chr, "(insufficient data)\n")
+    next
+  }
+
+  p_pair <- gggenomes(
+    seqs  = ss,
+    links = lf,
+    feats = list(
+      gypsy_GD   = gfA,
+      gypsy_Pear = gfB
+    )
+  ) +
+    geom_seq(aes(color = bin_id), size = 3) +
+    geom_coverage(
+      data   = feats(gypsy_GD),
+      aes(z  = score),
+      height = 0.25, offset = 0.35,
+      fill   = "#1f77b4", color = NA, alpha = 0.8
+    ) +
+    geom_coverage(
+      data   = feats(gypsy_Pear),
+      aes(z  = score),
+      height = 0.25, offset = -0.35,
+      fill   = "#ff7f0e", color = NA, alpha = 0.8
+    ) +
+    geom_link(aes(fill = sv_type), color = NA, alpha = 0.6) +
+    geom_bin_label(size = 5) +
+    scale_color_manual(values = c("Genome_A" = "#1f77b4",
+                                  "Genome_B" = "#ff7f0e")) +
+    scale_fill_manual(values = c("Collinear" = "grey80",
+                                 "Inversion" = "#8e44ad")) +
+    coord_cartesian(expand = TRUE, clip = "off") +
+    scale_x_continuous(labels = scales::label_number(big.mark = ",")) +
+    theme_bw(base_size = 12) +
+    ggtitle(paste0(gd_chr, ": Genome_A ↔ ", pear_chr, ": Genome_B")) +
+    labs(caption = "Blue: Gypsy density Genome_A (normalized) | Orange: Gypsy density Genome_B (normalized)") +
+    theme(
+      plot.title       = element_text(hjust = 0.5, face = "bold"),
+      plot.caption     = element_text(hjust = 0.5, size = 9, color = "grey40"),
+      axis.title       = element_blank(),
+      axis.text.y      = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.title     = element_blank()
+    )
+
+  ggsave(
+    filename = file.path(OUTDIR, paste0("synteny_", gd_chr, "_vs_", pear_chr, ".png")),
+    plot     = p_pair,
+    width    = 12,
+    height   = 4,
+    dpi      = 350
+  )
+
+  print(p_pair)
+}
+
+cat("\nDone! Results saved to:", OUTDIR, "\n")
